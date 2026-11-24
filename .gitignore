@@ -12,6 +12,5 @@ __pycache__/
 /.envs/
 /runs/
 
-# Algorithms written by the agent (`frontieror find-algorithms`); keep only the folder.
-/algorithms/*
-!/algorithms/.gitkeep
+# Algorithm scratch files.
+/algorithms/**/__pycache__/
