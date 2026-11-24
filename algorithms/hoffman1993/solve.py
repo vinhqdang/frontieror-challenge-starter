@@ -1,7 +1,9 @@
 import itertools
+import multiprocessing as mp
 import time
 
 import numpy as np
+import scipy.sparse as sp
 import highspy
 
 T0 = time.time()
@@ -65,13 +67,15 @@ def _parse(instance):
 
 
 def _columns_kept(data):
-    """Drop duplicate row sets (keep cheapest) when there are no base constraints."""
+    """Drop empty columns and, when there are no base constraints, duplicate row sets (keep cheapest)."""
     n = data["n"]
-    if data["nb"] > 0:
-        return list(range(n))
     ptr, row, cost = data["ptr"], data["row"], data["cost"]
+    if data["nb"] > 0:
+        return [j for j in range(n) if ptr[j + 1] > ptr[j]]
     best = {}
     for j in range(n):
+        if ptr[j + 1] == ptr[j]:
+            continue
         k = row[ptr[j] : ptr[j + 1]].tobytes()
         b = best.get(k)
         if b is None or cost[j] < cost[b]:
@@ -142,39 +146,231 @@ def _valid(data, chosen):
     return True
 
 
-def _run_highs(data, kept, lp, time_s, feasibility_only):
-    n_cols = len(kept)
-    h = highspy.Highs()
-    h.setOptionValue("output_flag", False)
-    h.setOptionValue("threads", 2)
-    h.setOptionValue("mip_rel_gap", 0.0)
-    h.setOptionValue("time_limit", float(max(0.5, time_s)))
-    if n_cols > 5000:
-        # HiGHS presolve (probing) can overrun the time limit on large models.
-        h.setOptionValue("presolve", "off")
-    if feasibility_only:
-        lp.col_cost_ = np.zeros(len(kept))
-        h.setOptionValue("mip_heuristic_effort", 0.5)
-    h.passModel(lp)
-    h.run()
-    if h.getInfo().primal_solution_status < 2:
-        return None
-    x = np.asarray(h.getSolution().col_value, dtype=np.float64)
-    chosen = [kept[i] for i in np.nonzero(x[: len(kept)] > 0.5)[0]]
-    return chosen if _valid(data, chosen) else None
+class _Search:
+    """Exact-cover depth-first branch and bound (iterative, resumable)."""
+
+    def __init__(self, data, kept):
+        self.data = data
+        m, n = data["m"], data["n"]
+        self.m = m
+        ptr, row = data["ptr"], data["row"]
+        self.cost = data["cost"]
+        self.size = np.diff(ptr).astype(np.float64)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            self.ratio = np.where(self.size > 0, self.cost / np.maximum(self.size, 1.0), np.inf)
+        ones = np.ones(len(row), dtype=np.float64)
+        self.AT = sp.csr_matrix((ones, row, ptr), shape=(n, m))  # n x m
+        self.A = self.AT.T.tocsr()  # m x n: row r -> columns covering r
+        self.a_ptr = self.A.indptr
+        self.a_idx = self.A.indices
+        self.ratio_nnz = self.ratio[self.a_idx]
+        self.nonempty = np.nonzero(np.diff(self.a_ptr) > 0)[0]
+        self.nonempty_start = self.a_ptr[self.nonempty]
+        self.D = data["D"]
+        self.nb = data["nb"]
+        self.d2 = data["d2"]
+        self.best = None
+        self.best_cost = np.inf
+        self.nodes = 0
+        self.done = False
+        self.stack = []
+        active = np.zeros(n, dtype=bool)
+        active[np.asarray(kept, dtype=np.int64)] = True
+        root = self._expand(
+            active,
+            np.zeros(m, dtype=bool),
+            0.0,
+            np.zeros(self.nb) if self.nb else None,
+            (),
+        )
+        if root is None:
+            self.done = True
+        else:
+            self.stack.append(root)
+
+    def offer(self, chosen):
+        """Accept an external solution if it is valid and better than the incumbent."""
+        chosen = [int(j) for j in chosen]
+        c = float(self.cost[np.asarray(chosen, dtype=np.int64)].sum()) if chosen else np.inf
+        if c < self.best_cost - 1e-9 and _valid(self.data, chosen):
+            self.best = chosen
+            self.best_cost = c
+            return True
+        return False
+
+    def _expand(self, active, covered, cost_, dx, chosen):
+        """Return a frame for an open node, or None if the node is a leaf or is pruned."""
+        self.nodes += 1
+        unc = ~covered
+        if not unc.any():
+            self.offer(chosen)
+            return None
+        cnt = self.A @ active.astype(np.float64)
+        if np.any(cnt[unc] == 0):
+            return None
+        vals = np.where(active[self.a_idx], self.ratio_nnz, np.inf)
+        rowmin = np.full(self.m, np.inf)
+        if self.nonempty.size:
+            rowmin[self.nonempty] = np.minimum.reduceat(vals, self.nonempty_start)
+        lb = cost_ + float(rowmin[unc].sum())
+        if lb >= self.best_cost - 1e-9:
+            return None
+        r = int(np.argmin(np.where(unc, cnt, np.inf)))
+        cands = self.a_idx[self.a_ptr[r] : self.a_ptr[r + 1]]
+        cands = cands[active[cands]]
+        order = np.lexsort((-self.size[cands], self.cost[cands]))
+        cands = cands[order]
+        return [active, covered, cost_, dx, chosen, cands, 0]
+
+    def _child(self, frame, c):
+        active, covered, cost_, dx, chosen = frame[0], frame[1], frame[2], frame[3], frame[4]
+        ndx = None
+        if dx is not None:
+            ndx = dx + self.D[:, c]
+            if np.any(ndx > self.d2 + 1e-9):
+                return None
+        p0, p1 = self.data["ptr"][c], self.data["ptr"][c + 1]
+        rows_c = self.data["row"][p0:p1]
+        hit = np.zeros(self.m, dtype=np.float64)
+        hit[rows_c] = 1.0
+        conflict = self.AT @ hit  # > 0 for every column sharing a row with c (incl. c)
+        nact = active & (conflict == 0)
+        ncov = covered.copy()
+        ncov[rows_c] = True
+        return self._expand(nact, ncov, cost_ + float(self.cost[c]), ndx, chosen + (int(c),))
+
+    def run(self, deadline, stop_on_first=False):
+        """Search until the deadline. Returns True when the whole tree has been explored."""
+        while self.stack:
+            if time.time() >= deadline:
+                return False
+            if stop_on_first and self.best is not None:
+                return False
+            f = self.stack[-1]
+            if f[6] >= len(f[5]):
+                self.stack.pop()
+                continue
+            c = int(f[5][f[6]])
+            f[6] += 1
+            child = self._child(f, c)
+            if child is not None:
+                self.stack.append(child)
+        self.done = True
+        return True
 
 
-def _solve_mip(data, deadline):
+def _mip_worker(conn, data, kept, incumbent, time_s):
+    try:
+        lp = _build_lp(data, kept)
+        h = highspy.Highs()
+        h.setOptionValue("output_flag", False)
+        h.setOptionValue("threads", 2)
+        h.setOptionValue("mip_rel_gap", 0.0)
+        h.setOptionValue("time_limit", float(max(0.5, time_s)))
+        h.passModel(lp)
+        if incumbent:
+            pos = {c: i for i, c in enumerate(kept)}
+            x = np.zeros(len(kept))
+            x[[pos[c] for c in incumbent]] = 1.0
+            sol = highspy.HighsSolution()
+            sol.col_value = x.tolist()
+            h.setSolution(sol)
+        h.run()
+        result = None
+        if h.getInfo().primal_solution_status >= 2:
+            x = np.asarray(h.getSolution().col_value, dtype=np.float64)
+            cand = [int(kept[i]) for i in np.nonzero(x[: len(kept)] > 0.5)[0]]
+            if _valid(data, cand):
+                result = cand
+        conn.send(result)
+    except Exception:
+        try:
+            conn.send(None)
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+
+def _run_mip_process(data, kept, incumbent, time_s, kill_at):
+    """HiGHS MIP in a forked child; the child is hard-killed at kill_at if still running."""
+    ctx = mp.get_context("fork")
+    parent, child = ctx.Pipe(duplex=False)
+    p = ctx.Process(target=_mip_worker, args=(child, data, kept, incumbent, time_s), daemon=True)
+    p.start()
+    child.close()
+    result = None
+    try:
+        wait = kill_at - time.time()
+        if wait > 0 and parent.poll(wait):
+            result = parent.recv()
+    except Exception:
+        result = None
+    finally:
+        if p.is_alive():
+            p.kill()
+        p.join(1.0)
+        parent.close()
+    return result
+
+
+def _solve_exact(data, deadline):
     kept = _columns_kept(data)
-    lp = _build_lp(data, kept)
-    budget = deadline - time.time()
-    if budget < 1.0:
+    if not kept:
         return None
-    reserve = min(5.0, 0.1 * budget)
-    chosen = _run_highs(data, kept, lp, budget - reserve, False)
-    if chosen is None and deadline - time.time() > 1.0:
-        chosen = _run_highs(data, kept, lp, deadline - time.time(), True)
-    return chosen
+    search = None
+    try:
+        search = _Search(data, kept)
+        start = _first_fit(data)
+        if start:
+            search.offer(start)
+        span = max(deadline - T0, 1.0)
+        if not search.done:
+            search.run(T0 + 0.40 * span)
+        if not search.done and search.best is None:
+            search.run(T0 + 0.85 * span, stop_on_first=True)
+    except Exception:
+        pass
+    if search is None:
+        return None
+    if search.done:
+        return search.best
+
+    now = time.time()
+    if deadline - now > 3.0:
+        try:
+            res = _run_mip_process(
+                data,
+                kept,
+                search.best,
+                deadline - now - 2.0,
+                deadline - 0.5,
+            )
+            if res is not None:
+                search.offer(res)
+        except Exception:
+            pass
+
+    try:
+        search.run(deadline - 0.5)
+    except Exception:
+        pass
+    return search.best
+
+
+def _first_fit(data):
+    """Columns taken in index order whenever disjoint from those already taken; a valid partition or None."""
+    ptr, row = data["ptr"], data["row"]
+    covered = np.zeros(data["m"], dtype=bool)
+    chosen = []
+    for j in range(data["n"]):
+        r = row[ptr[j] : ptr[j + 1]]
+        if r.size and not covered[r].any():
+            covered[r] = True
+            chosen.append(j)
+            if covered.all():
+                break
+    return chosen if _valid(data, chosen) else None
 
 
 def _greedy(data):
@@ -209,9 +405,14 @@ def solve(instance, time_limit_s):
     data = _parse(instance)
     chosen = None
     try:
-        chosen = _solve_mip(data, deadline)
+        chosen = _solve_exact(data, deadline)
     except Exception:
         chosen = None
+    if chosen is None:
+        try:
+            chosen = _first_fit(data)
+        except Exception:
+            chosen = None
     if chosen is None:
         try:
             chosen = _greedy(data)
